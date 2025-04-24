@@ -1,0 +1,35 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: curl-check-job
+spec:
+  schedule: "0 2 * * *"  # 2 AM every day
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: curl-container
+              image: curlimages/curl:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  response=$(curl -s -o /dev/null -w "%{http_code}" -u "$USERNAME:$PASSWORD" https://example.com/api/health)
+                  if [ "$response" -ne 200 ]; then
+                    echo "Error: Received HTTP $response"
+                  else
+                    echo "Success: Received HTTP $response"
+                  fi
+              env:
+                - name: USERNAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: curl-auth-secret
+                      key: username
+                - name: PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: curl-auth-secret
+                      key: password
+          restartPolicy: OnFailure
