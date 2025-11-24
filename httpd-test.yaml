@@ -1,0 +1,169 @@
+#####################################################################
+# PVC: RWX (ReadWriteMany)
+#####################################################################
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: html-rwx-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: ocs-storagecluster-cephfs
+---
+#####################################################################
+# PVC: RWO (ReadWriteOnce)
+#####################################################################
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: html-rwo-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: ocs-storagecluster-rbd
+---
+#####################################################################
+# CONFIGMAP: HTML Template + File Write Script
+#####################################################################
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: html-template-and-scripts
+data:
+  index.html.template: |
+    <html>
+      <head><title>Storage Migration Test App</title></head>
+      <body>
+        <h1>Storage Migration Test App</h1>
+        <p><b>Pod Name:</b> $POD_NAME</p>
+        <p><b>Pod IP:</b> $POD_IP</p>
+        <p><b>Hostname:</b> $HOSTNAME</p>
+        <p><b>Node Name:</b> $NODE_NAME</p>
+        <p><b>Storage Mode:</b> PVC mounted at /opt/app-root/src/html</p>
+        <hr>
+        <p>Test files generated under: <b>/opt/app-root/src/html/test-data</b></p>
+      </body>
+    </html>
+
+  write_test_files.sh: |
+    #!/bin/sh
+    HTML_DIR=/opt/app-root/src/html
+    mkdir -p $HTML_DIR/test-data
+
+    # Initial unique file per pod
+    FILE="$HTML_DIR/test-data/file-$POD_NAME.txt"
+    echo "Pod: $POD_NAME" > $FILE
+    echo "Hostname: $HOSTNAME" >> $FILE
+    echo "Pod IP: $POD_IP" >> $FILE
+    echo "Node: $NODE_NAME" >> $FILE
+    date >> $FILE
+    chmod 664 $FILE
+
+    # Generate HTML with env vars substituted
+    envsubst < $HTML_DIR/index.html.template > $HTML_DIR/index.html
+
+    # Periodic file generation loop (every 30 seconds)
+    while true; do
+      NEWFILE="$HTML_DIR/test-data/file-$POD_NAME-$(date +%s).txt"
+      echo "Periodic file from pod $POD_NAME at $(date)" > $NEWFILE
+      chmod 664 $NEWFILE
+      sleep 30
+    done
+---
+#####################################################################
+# DEPLOYMENT (change replicas + claimName for RWX/RWO testing)
+#####################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: storage-migration-test-app
+spec:
+  replicas: 3       # For RWX → 3+, For RWO → 1
+  selector:
+    matchLabels:
+      app: storage-migration-test-app
+  template:
+    metadata:
+      labels:
+        app: storage-migration-test-app
+    spec:
+      containers:
+      - name: python-app
+        image: your-python-app-image:latest
+        ports:
+        - containerPort: 8080
+        env:
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: HOSTNAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+        command: ["/bin/sh", "-c"]
+        args:
+          - chmod +x /tmp/write_test_files.sh && /tmp/write_test_files.sh & exec python app.py
+        volumeMounts:
+          - name: html
+            mountPath: /opt/app-root/src/html
+          - name: html-config
+            mountPath: /opt/app-root/src/html/index.html.template
+            subPath: index.html.template
+          - name: html-config
+            mountPath: /tmp/write_test_files.sh
+            subPath: write_test_files.sh
+
+      volumes:
+        - name: html
+          persistentVolumeClaim:
+            # RWX → html-rwx-pvc
+            # RWO → html-rwo-pvc
+            claimName: html-rwx-pvc
+
+        - name: html-config
+          configMap:
+            name: html-template-and-scripts
+---
+#####################################################################
+# SERVICE
+#####################################################################
+apiVersion: v1
+kind: Service
+metadata:
+  name: storage-migration-test-service
+spec:
+  selector:
+    app: storage-migration-test-app
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+---
+#####################################################################
+# ROUTE
+#####################################################################
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: storage-migration-test-route
+spec:
+  to:
+    kind: Service
+    name: storage-migration-test-service
+  port:
+    targetPort: 8080
