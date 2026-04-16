@@ -1,0 +1,147 @@
+# ClusterLogForwarder 
+# Routing: All→Splunk via Cribl (with debug/trace drop filter), Errors→Dynatrace
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: instance
+  namespace: openshift-logging
+spec:
+  serviceAccount:
+    name: cluster-logging-operator
+
+  outputs:
+    # Output 1: Splunk via Cribl HEC
+    # TODO: Update URL to actual Cribl HEC endpoint
+    - name: splunk-via-cribl
+      type: splunk
+      splunk:
+        url: "https://cribl-hec-endpoint.cmgmi.local:8088"
+        index: "openshift-prod"
+      secret:
+        name: splunk-hec-token
+      tls:
+        insecureSkipVerify: false
+
+    # Output 2: Splunk via Cribl — splunk-demo namespace (index: openshift_test)
+    # Pattern: Add a new output per namespace/team that needs a different Splunk index.
+    # Same HEC endpoint, different index.
+    - name: splunk-splunk-demo
+      type: splunk
+      splunk:
+        url: "https://cribl-hec-endpoint.cmgmi.local:8088"
+        index: "openshift_test"
+      secret:
+        name: splunk-hec-token
+      tls:
+        insecureSkipVerify: false
+
+    # --- To add another namespace with a different index, copy the block above ---
+    # - name: splunk-<namespace>
+    #   type: splunk
+    #   splunk:
+    #     url: "https://cribl-hec-endpoint.cmgmi.local:8088"
+    #     index: "<their-index>"
+    #   secret:
+    #     name: splunk-hec-token
+    #   tls:
+    #     insecureSkipVerify: false
+
+    # Output 3: Dynatrace (errors only)
+    # TODO: Update URL and token to actual Dynatrace environment
+    - name: dynatrace-errors
+      type: http
+      http:
+        url: "https://DYNATRACE_ENV.live.dynatrace.com/api/v2/logs/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token DT_API_TOKEN"
+          Content-Type: "application/json; charset=utf-8"
+
+  inputs:
+    # Input: Application logs scoped to splunk-demo namespace
+    # Pattern: Add a new input per namespace that needs custom routing.
+    - name: app-splunk-demo
+      type: application
+      application:
+        namespaces:
+          - splunk-demo
+
+    # --- To add another namespace, copy the block above ---
+    # - name: app-<namespace>
+    #   type: application
+    #   application:
+    #     namespaces:
+    #       - <namespace>
+
+  filters:
+    # Filter: Drop debug/trace logs BEFORE Splunk — prevents daily limit hits
+    - name: drop-debug
+      type: drop
+      drop:
+        - test:
+            - field: .level
+              matches: "^(debug|trace|DEBUG|TRACE)$"
+
+    # Filter: Keep only logs containing the keyword "forward_message_to_splunk"
+    # Drops everything that does NOT match the keyword in .message
+    - name: keyword-forward-to-splunk
+      type: drop
+      drop:
+        - test:
+            - field: .message
+              notMatches: "forward_message_to_splunk"
+
+    # Filter: Keep only error-level logs for Dynatrace
+    - name: errors-only
+      type: drop
+      drop:
+        - test:
+            - field: .level
+              notMatches: "^(error|err|fatal|critical|panic)$"
+            - field: .message
+              notMatches: "(?i)(exception|error|fatal|panic|stack.?trace)"
+
+  pipelines:
+    # Pipeline 1: Application logs → Splunk (debug/trace dropped)
+    - name: app-to-splunk
+      inputRefs:
+        - application
+      outputRefs:
+        - splunk-via-cribl
+      filterRefs:
+        - drop-debug
+
+    # Pipeline 2: Infrastructure logs → Splunk (no filter)
+    - name: infra-to-splunk
+      inputRefs:
+        - infrastructure
+      outputRefs:
+        - splunk-via-cribl
+
+    # Pipeline 3: splunk-demo namespace → Splunk (keyword-filtered, index: openshift_test)
+    # Only logs matching "forward_message_to_splunk" from the splunk-demo namespace
+    - name: splunk-demo-keyword-to-splunk
+      inputRefs:
+        - app-splunk-demo
+      outputRefs:
+        - splunk-splunk-demo
+      filterRefs:
+        - keyword-forward-to-splunk
+
+    # --- To add another namespace pipeline, copy the block above ---
+    # - name: <namespace>-keyword-to-splunk
+    #   inputRefs:
+    #     - app-<namespace>
+    #   outputRefs:
+    #     - splunk-<namespace>
+    #   filterRefs:
+    #     - keyword-forward-to-splunk
+
+    # Pipeline 4: Error-level logs → Dynatrace (all namespaces)
+    - name: errors-to-dynatrace
+      inputRefs:
+        - application
+      outputRefs:
+        - dynatrace-errors
+      filterRefs:
+        - errors-only
